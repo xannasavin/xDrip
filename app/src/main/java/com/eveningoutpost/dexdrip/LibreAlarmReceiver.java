@@ -65,10 +65,15 @@ public class LibreAlarmReceiver extends BroadcastReceiver {
         return (lib_raw_value * LIBRE_MULTIPLIER); // to match (raw/8.5)*1000
     }
 
-    private static void createBGfromGD(GlucoseData gd, boolean quick) {
+    private static void createBGfromGD(GlucoseData gd, boolean use_smoothed_data, boolean quick) {
         final double converted;
         if (gd.glucoseLevelRaw > 0) {
-            converted = convert_for_dex(gd.glucoseLevelRaw);
+            if(use_smoothed_data && gd.glucoseLevelRawSmoothed > 0) {
+                converted = convert_for_dex(gd.glucoseLevelRawSmoothed);
+                Log.e(TAG,"Using smoothed value " + converted + " instead of " + convert_for_dex(gd.glucoseLevelRaw) );
+            } else {
+                converted = convert_for_dex(gd.glucoseLevelRaw);
+            }
         } else {
             converted = 12; // RF error message - might be something else like unconstrained spline
         }
@@ -152,7 +157,8 @@ public class LibreAlarmReceiver extends BroadcastReceiver {
                                 try {
                                     final ReadingData.TransferObject object =
                                             new Gson().fromJson(data, ReadingData.TransferObject.class);
-                                    processReadingDataTransferObject(object, JoH.tsl(), "LibreAlarm", false);
+                                    object.data.CalculateSmothedData();
+                                    processReadingDataTransferObject(object, JoH.tsl(), "LibreAlarm", false, null, null);
                                     Log.d(TAG, "At End: Oldest : " + JoH.dateTimeText(oldest_cmp) + " Newest : " + JoH.dateTimeText(newest_cmp));
                                 } catch (Exception e) {
                                     Log.wtf(TAG, "Could not process data structure from LibreAlarm: " + e.toString());
@@ -173,10 +179,10 @@ public class LibreAlarmReceiver extends BroadcastReceiver {
         }.start();
     }
 
-    public static void processReadingDataTransferObject(ReadingData.TransferObject object, long CaptureDateTime, String tagid, boolean allowUpload) {
+    public static void processReadingDataTransferObject(ReadingData.TransferObject object, long CaptureDateTime, String tagid, boolean allowUpload, byte []patchUid,  byte []patchInfo) {
     	Log.i(TAG, "Data that was recieved from librealarm is " + HexDump.dumpHexString(object.data.raw_data));
     	// Save raw block record (we start from block 0)
-        LibreBlock.createAndSave(tagid, CaptureDateTime, object.data.raw_data, 0, allowUpload);
+        LibreBlock.createAndSave(tagid, CaptureDateTime, object.data.raw_data, 0, allowUpload, patchUid,  patchInfo);
 
         if(Pref.getBooleanDefaultFalse("external_blukon_algorithm")) {
             if(object.data.raw_data == null) {
@@ -184,14 +190,14 @@ public class LibreAlarmReceiver extends BroadcastReceiver {
                 JoH.static_toast_long(gs(R.string.please_update_librealarm_to_use_oop_algorithm));
                 return;
             }
-            LibreOOPAlgorithm.SendData(object.data.raw_data, CaptureDateTime);
+            LibreOOPAlgorithm.sendData(object.data.raw_data, CaptureDateTime, tagid);
             return;
         }
         CalculateFromDataTransferObject(object, use_raw_);
     }
         
     public static void CalculateFromDataTransferObject(ReadingData.TransferObject object, boolean use_raw) {
-    	
+    	boolean use_smoothed_data = Pref.getBooleanDefaultFalse("libre_use_smoothed_data");
         // insert any recent data we can
         final List<GlucoseData> mTrend = object.data.trend;
         if (mTrend != null && mTrend.size() > 0) {
@@ -204,9 +210,15 @@ public class LibreAlarmReceiver extends BroadcastReceiver {
                 Pref.setBoolean("nfc_age_problem", false);
                 Log.d(TAG, "Sensor age advanced to: " + thisSensorAge);
             } else if (thisSensorAge == sensorAge) {
-                Log.wtf(TAG, "Sensor age has not advanced: " + sensorAge);
-                JoH.static_toast_long(gs(R.string.sensor_clock_has_not_advanced));
-                Pref.setBoolean("nfc_age_problem", true);
+                // This is only a problem if we don't have a recent reading. It could happen that we have a recent
+                // reading, and then BT disconnects and connects after a few seconds, and we have a new reading (where 
+                // sensor did not advance). This does not mean that a sensor is not advancing. Only if this is happening
+                // for a few minutes, this is a problem.
+                if(BgReading.getTimeSinceLastReading() > 11 * 60 * 1000) {
+                    Log.wtf(TAG, "Sensor age has not advanced: " + sensorAge);
+                    JoH.static_toast_long(gs(R.string.sensor_clock_has_not_advanced));
+                    Pref.setBoolean("nfc_age_problem", true);
+                }
                 return; // do not try to insert again
             } else {
                 Log.wtf(TAG, "Sensor age has gone backwards!!! " + sensorAge);
@@ -232,7 +244,7 @@ public class LibreAlarmReceiver extends BroadcastReceiver {
                         continue;
                     }
                     if (use_raw) {
-                        createBGfromGD(gd, false); // not quick for recent
+                        createBGfromGD(gd, use_smoothed_data, false); // not quick for recent
                     } else {
                         BgReading.bgReadingInsertFromInt(gd.glucoseLevel, gd.realDate, true);
                     }
@@ -254,13 +266,13 @@ public class LibreAlarmReceiver extends BroadcastReceiver {
                     polyxList.add((double) gd.realDate);
                     if (use_raw) {
                         polyyList.add((double) gd.glucoseLevelRaw);
-                        createBGfromGD(gd, true);
+                        // For history, data is already averaged, no need for us to use smoothed data
+                        createBGfromGD(gd, false, true);
                     } else {
                         polyyList.add((double) gd.glucoseLevel);
                         // add in the actual value
                         BgReading.bgReadingInsertFromInt(gd.glucoseLevel, gd.realDate, false);
                     }
-
                 }
 
                 //ConstrainedSplineInterpolator splineInterp = new ConstrainedSplineInterpolator();
@@ -280,7 +292,8 @@ public class LibreAlarmReceiver extends BroadcastReceiver {
                             if (d)
                                 Log.d(TAG, "Spline: " + JoH.dateTimeText((long) ptime) + " value: " + (int) polySplineF.value(ptime));
                             if (use_raw) {
-                                createBGfromGD(new GlucoseData((int) polySplineF.value(ptime), ptime), true);
+                                // Here we do not use smoothed data, since data is already smoothed for the history
+                                createBGfromGD(new GlucoseData((int) polySplineF.value(ptime), ptime), false, true);
                             } else {
                                 BgReading.bgReadingInsertFromInt((int) polySplineF.value(ptime), ptime, false);
                             }
